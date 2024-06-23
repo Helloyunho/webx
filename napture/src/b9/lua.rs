@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::rc::Rc;
 use std::thread;
 
@@ -6,14 +8,31 @@ use super::css::Styleable;
 use super::html::Tag;
 use glib::GString;
 use gtk::prelude::*;
-use mlua::{prelude::*, StdLib};
 
-use mlua::{Lua, LuaSerdeExt, OwnedFunction, Value};
+use mlua::{prelude::*, StdLib, AsChunk, ChunkMode};
+use mlua::{OwnedFunction, Value};
+
+struct SafeStringChunk<'lua, 'a> {
+    inner: &'a str,
+    _marker: PhantomData<&'lua ()>,
+}
+
+impl<'lua, 'a> AsChunk<'lua, 'a> for SafeStringChunk<'lua, 'a> {
+    fn mode(&self) -> Option<ChunkMode> {
+        Some(ChunkMode::Text)
+    }
+
+    fn source(self) -> Result<Cow<'a, [u8]>, std::io::Error> {
+        Ok(Cow::Borrowed(self.inner.as_bytes()))
+    }
+}
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Map;
 
-use crate::lualog;
+use crate::{lualog, globals::LUA_TIMEOUTS};
+use glib::translate::FromGlib;
+use glib::SourceId;
 
 pub trait Luable: Styleable {
     fn get_css_name(&self) -> String;
@@ -27,6 +46,7 @@ pub trait Luable: Styleable {
     fn set_href_(&self, href: String);
     fn set_opacity_(&self, amount: f64);
     fn set_source_(&self, source: String);
+    fn set_visible_(&self, visible: bool);
 
     fn _on_click(&self, func: &LuaOwnedFunction);
     fn _on_submit(&self, func: &LuaOwnedFunction);
@@ -38,6 +58,40 @@ pub trait Luable: Styleable {
 //     sleep(Duration::from_millis(ms)).await;
 //     Ok(())
 // }
+
+fn set_timeout(_lua: &Lua, func: LuaOwnedFunction, ms: u64) -> LuaResult<i32> {
+    if let Ok(mut timeouts) = LUA_TIMEOUTS.lock() {
+        if ms == 0 {
+            if let Err(e) = func.call::<_, ()>(()) {
+                lualog!("error", format!("error calling function in set_timeout: {}", e));
+            }
+            return Ok(-1);
+        } else {
+            let handle = glib::spawn_future_local(async move {
+                glib::timeout_future(std::time::Duration::from_millis(ms)).await;
+                if let Err(e) = func.call::<_, ()>(()) {
+                    lualog!("error", format!("error calling function in set_timeout: {}", e));
+                }
+            });
+            timeouts.push(handle.source().clone());
+            if let Some(id) = handle.as_raw_source_id() {
+                return Ok(id as i32);
+            } else { return Ok(-1); }
+        }
+    }
+    Err(LuaError::runtime("couldn't create timeout"))
+}
+
+pub(crate) fn clear_timeout(id: i32) -> LuaResult<()> {
+    if id > 0 {
+        let id = unsafe {SourceId::from_glib(id.try_into().unwrap())};
+        if let Some(source) = glib::MainContext::default()
+             .find_source_by_id(&id) {
+            source.destroy();
+        }
+    }
+    Ok(())
+}
 
 fn get(
     lua: &Lua,
@@ -64,6 +118,7 @@ fn get(
             let tags9 = Rc::clone(&tags);
             let tags10 = Rc::clone(&tags);
             let tags11 = Rc::clone(&tags);
+            let tags12 = Rc::clone(&tags);
 
             let table = lua.create_table()?;
 
@@ -80,7 +135,10 @@ fn get(
             )?;
             table.set(
                 "set_content",
-                lua.create_function(move |_, label: String| {
+                lua.create_function(move |_, label: Option<String>| {
+                    let label = if let Some(label) = label {
+                        label
+                    } else { "".to_string()};
                     tags2.borrow()[i].widget.set_contents_(label);
                     Ok(())
                 })?,
@@ -148,6 +206,13 @@ fn get(
                     Ok(ok)
                 })?,
             )?;
+            table.set(
+                "set_visible",
+                lua.create_function(move |_, visible: bool| {
+                    let ok = tags12.borrow()[i].widget.set_visible_(visible);
+                    Ok(ok)
+                })?,
+            )?;
 
             if multi {
                 global_table.set(i2, table)?;
@@ -185,13 +250,15 @@ fn print(_lua: &Lua, msg: LuaMultiValue) -> LuaResult<()> {
 // todo: make this async if shit breaks
 pub(crate) async fn run(luacode: String, tags: Rc<RefCell<Vec<Tag>>>, taburl: String) -> LuaResult<()> {
     let lua = Lua::new_with(
-        StdLib::COROUTINE | StdLib::STRING |
-        StdLib::TABLE | StdLib::MATH,
+        /*StdLib::COROUTINE | StdLib::STRING |
+        StdLib::TABLE | StdLib::MATH,*/
+        StdLib::ALL_SAFE,
         LuaOptions::new().catch_rust_panics(true)
     )?;
     let globals = lua.globals();
 
     let window_table = lua.create_table()?;
+    let json_table = lua.create_table()?;
     let query_table = lua.create_table()?;
 
     let parts: Vec<&str> = taburl.splitn(2, '?').collect();
@@ -297,8 +364,85 @@ pub(crate) async fn run(luacode: String, tags: Rc<RefCell<Vec<Tag>>>, taburl: St
         lua.to_value(&json)
     })?;
 
+    let json_stringify = lua.create_function(|lua, table: LuaTable| {
+        match serde_json::to_string(&table) {
+            Ok(value) => Ok(lua.to_value(&value)?),
+            Err(_) => {
+                lualog!(
+                    "error",
+                    format!("Failed to stringify JSON. Returning null.")
+                );
+                Ok(lua.null())
+            }
+        }
+    })?;
+
+    let json_parse = lua.create_function(|lua, json: String| {
+        match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(value) => Ok(lua.to_value(&value)?),
+            Err(_) => {
+                lualog!(
+                    "error",
+                    format!("Failed to parse JSON. Returning null.")
+                );
+                Ok(lua.null())
+            }
+        }
+    })?;
+
+    let require = lua.create_async_function(|lua, module: String| async move {
+        if !module.starts_with("http://") && !module.starts_with("https://") {
+            lualog!("error", "Module argument must be a URL.");
+            return Ok(lua.null());
+        }
+
+        let handle = thread::spawn(move || {
+            let client = reqwest::blocking::Client::new();
+
+            let req = client.get(module);
+
+            let res = match req.send() {
+                Ok(res) => res,
+                Err(e) => {
+                    return format!("Failed to send request: {}", e).into();
+                }
+            };
+
+            let text = res.text().unwrap_or_default();
+
+            text
+        });
+
+        let result = match handle.join() {
+            Ok(result) => result,
+            Err(_) => {
+                lualog!(
+                    "error",
+                    format!("Failed to join request thread at fetch request. Originates from the Lua runtime. Returning null.")
+                );
+                "null".to_string()
+            }
+        };
+
+        if let Err(e) = lua.sandbox(true) {
+            lualog!("error", format!("failed to enable sandbox: {}", e));
+            Err(LuaError::runtime("failed to enable sandbox"))
+        } else {
+            let safe_chunk = SafeStringChunk {
+                inner: &result,
+                _marker: PhantomData,
+            };
+
+            let load = lua.load(safe_chunk);
+            load.eval::<LuaValue>()
+        }
+    })?;
+
     window_table.set("link", taburl)?;
     window_table.set("query", query_table)?;
+
+    json_table.set("stringify", json_stringify)?;
+    json_table.set("parse", json_parse)?;
 
     globals.set("print", lua.create_function(print)?)?;
     globals.set(
@@ -307,19 +451,43 @@ pub(crate) async fn run(luacode: String, tags: Rc<RefCell<Vec<Tag>>>, taburl: St
             get(lua, class, tags.clone(), multiple.unwrap_or(false))
         })?
     )?;
+    globals.set(
+        "set_timeout",
+        lua.create_function(move |lua, (func, ms): (LuaOwnedFunction, u64) | {
+           set_timeout(lua, func, ms)
+        })?
+    )?;
+    globals.set(
+        "clear_timeout",
+        lua.create_function(move |_lua, id: i32| {
+           clear_timeout(id)
+        })?
+    )?;
     globals.set("fetch", fetchtest)?;
+    globals.set("json", json_table)?;
     globals.set("window", window_table)?;
+    globals.set("require", require)?;
 
-    let ok = lua.load(luacode).eval::<LuaMultiValue>();
+    if let Err(e) = lua.sandbox(true) {
+        lualog!("error", format!("failed to enable sandbox: {}", e));
+        Err(LuaError::runtime("failed to enable sandbox"))
+    } else {
+        let safe_chunk = SafeStringChunk {
+            inner: &luacode,
+            _marker: PhantomData,
+        };
 
-    match ok {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            eprintln!(
-                "--------------------------\nerror: {}\n--------------------------------",
-                e
-            );
-            Err(LuaError::runtime("Failed to run script!"))
+        let ok = lua.load(safe_chunk).eval::<LuaMultiValue>();
+
+        match ok {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                eprintln!(
+                    "--------------------------\nerror: {}\n--------------------------------",
+                    e
+                );
+                Err(LuaError::runtime("Failed to run script!"))
+            }
         }
     }
 }
@@ -360,6 +528,9 @@ impl Luable for gtk::Label {
             "warning",
             "This component do not support the \"set_source\" method. Are you perhaps looking for the \"img\" tag?"
         );
+    }
+    fn set_visible_(&self, visible: bool) {
+        self.set_visible(visible);
     }
     fn get_opacity_(&self) -> f64 {
         self.opacity()
@@ -434,6 +605,9 @@ impl Luable for gtk::DropDown {
             "warning",
             "This component do not support the \"set_source\" method. Are you perhaps looking for the \"img\" tag?"
         );
+    }
+    fn set_visible_(&self, visible: bool) {
+        self.set_visible(visible);
     }
     fn get_opacity_(&self) -> f64 {
         self.opacity()
@@ -512,6 +686,9 @@ impl Luable for gtk::LinkButton {
             "This component do not support the \"set_source\" method. Are you perhaps looking for the \"img\" tag?"
         );
     }
+    fn set_visible_(&self, visible: bool) {
+        self.set_visible(visible);
+    }
     fn set_contents_(&self, contents: String) {
         self.set_label(&contents);
         self.style();
@@ -573,6 +750,9 @@ impl Luable for gtk::Box {
             "This component do not support the \"get_source\" method. Are you perhaps looking for the \"img\" tag?"
         );
         "".to_string()
+    }
+    fn set_visible_(&self, visible: bool) {
+        self.set_visible(visible);
     }
     fn set_source_(&self, _: String) {
         lualog!(
@@ -648,6 +828,9 @@ impl Luable for gtk::TextView {
     }
     fn set_contents_(&self, contents: String) {
         self.buffer().set_text(&contents);
+    }
+    fn set_visible_(&self, visible: bool) {
+        self.set_visible(visible);
     }
     fn get_source_(&self) -> String {
         lualog!(
@@ -734,6 +917,9 @@ impl Luable for gtk::Separator {
         );
         "".to_string()
     }
+    fn set_visible_(&self, visible: bool) {
+        self.set_visible(visible);
+    }
     fn set_source_(&self, _: String) {
         lualog!(
             "warning",
@@ -801,6 +987,9 @@ impl Luable for gtk::Picture {
             "warning",
             "\"img\" component does not support the \"set_content\" method."
         );
+    }
+    fn set_visible_(&self, visible: bool) {
+        self.set_visible(visible);
     }
     fn get_source_(&self) -> String {
         self.alternative_text().unwrap_or(GString::new()).to_string()
@@ -886,6 +1075,9 @@ impl Luable for gtk::Entry {
             "This component do not support the \"set_source\" method. Are you perhaps looking for the \"img\" tag?"
         );
     }
+    fn set_visible_(&self, visible: bool) {
+        self.set_visible(visible);
+    }
     fn set_contents_(&self, contents: String) {
         self.buffer().set_text(contents);
     }
@@ -957,6 +1149,9 @@ impl Luable for gtk::Button {
     }
     fn set_contents_(&self, contents: String) {
         self.set_label(&contents);
+    }
+    fn set_visible_(&self, visible: bool) {
+        self.set_visible(visible);
     }
     fn get_source_(&self) -> String {
         lualog!(
